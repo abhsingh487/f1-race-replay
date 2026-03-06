@@ -12,7 +12,7 @@ import tempfile
 import uuid
 from src.f1_data import get_race_weekends_by_year, get_race_weekends_by_place, get_all_unique_race_names, load_session
 from src.gui.settings_dialog import SettingsDialog
-
+from src.lib.season import get_season
 
 # Worker thread to fetch schedule without blocking UI
 class FetchScheduleWorker(QThread):
@@ -42,7 +42,7 @@ class RaceSelectionWindow(QMainWindow):
         self.worker = None
         self.loading_session = False
         self.selected_session_title = None
-        self.current_year = 2025  # Update as needed
+        self.current_year = get_season()
         self.selected_year=self.current_year 
 
         self.setWindowTitle("F1 Race Replay - Session Selection")
