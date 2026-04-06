@@ -54,10 +54,17 @@ class InsightsMenu(QMainWindow):
 
         content_layout.addWidget(self.create_category_section(
             "Live Telemetry",
-            [
-                ("Telemetry Stream Viewer", "View raw telemetry data", self.launch_telemetry_viewer),
-                ("Driver Live Telemetry", "Speed, gear, throttle & braking for a selected driver", self.launch_driver_telemetry),
-            ]
+        [
+            ("Telemetry Stream Viewer", "View raw telemetry data", self.launch_telemetry_viewer),
+            ("Driver Live Telemetry", "Speed, gear, throttle & braking for a selected driver", self.launch_driver_telemetry),
+        ]
+        ))
+
+        content_layout.addWidget(self.create_category_section(
+            "AI Analysis",
+        [
+            ("F1 AI Race Analyst", "AI-powered commentary and insights from live telemetry", self.launch_ai_analyst),
+        ]
         ))
 
         content_layout.addWidget(self.create_category_section(
@@ -183,6 +190,13 @@ class InsightsMenu(QMainWindow):
         print("🚀 Launching: Track Position Map")
         from src.insights.track_position_window import TrackPositionWindow
         window = TrackPositionWindow()
+        window.show()
+        self.opened_windows.append(window)
+
+    def launch_ai_analyst(self):
+        print("🚀 Launching: F1 AI Race Analyst")
+        from src.insights.f1_ai_analyst import F1AIAnalystWindow
+        window = F1AIAnalystWindow()
         window.show()
         self.opened_windows.append(window)
 
