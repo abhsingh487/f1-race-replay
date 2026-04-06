@@ -1,0 +1,517 @@
+## The Big Picture — How All Files Connect
+
+Before diving in, here's the flow of the entire project:
+
+```
+main.py
+  ↓ parses CLI args
+  ↓ loads FastF1 session
+  ↓ calls f1_data.py → fetches & processes telemetry
+  ↓ calls run_session.py → launches Arcade window
+  ↓ calls interfaces/race_replay.py OR interfaces/qualifying.py
+  ↓ calls ui_components.py → draws everything on screen
+  ↓ calls services/stream.py → broadcasts live telemetry
+  ↓ gui/insights_menu.py → side panel windows
+```
+
+---
+
+## File 1 — `src/lib/time.py`
+
+This is the simplest file. Just two utility functions.
+
+```python
+import re
+from typing import Optional
+```
+`re` is Python's **regular expressions** module — used for pattern matching in strings. `Optional` from `typing` means a function can return either a value or `None`.
+
+```python
+def format_time(seconds: float) -> str:
+    if seconds is None or seconds < 0:
+        return "N/A"
+    minutes = int(seconds // 60)
+    secs = seconds % 60
+    return f"{minutes:02}:{secs:06.3f}"
+```
+This converts raw seconds (like `86.423`) into `"01:26.423"`. The `//` is **floor division** (gives whole number). The `%` gives the **remainder**. The format string `{minutes:02}` means "pad with zeros to 2 digits". `{secs:06.3f}` means "6 characters wide, 3 decimal places".
+
+```python
+def parse_time_string(time_str: str) -> Optional[float]:
+```
+This does the **reverse** — takes a string like `"01:26.423"` and converts it back to seconds. It handles many different formats because FastF1 returns time strings inconsistently. The `re.split(r'[:.]', s)` splits the string on either `:` or `.` using regex.
+
+---
+
+## File 2 — `src/lib/tyres.py`
+
+Very simple — a lookup table for tyre compounds.
+
+```python
+tyre_compounds_ints = {
+    "SOFT": 0,
+    "MEDIUM": 1,
+    "HARD": 2,
+    "INTERMEDIATE": 3,
+    "WET": 4,
+}
+```
+This is a **dictionary** mapping tyre name strings to integers. The project stores tyres as integers internally because numbers are faster to process than strings when dealing with millions of data points.
+
+```python
+def get_tyre_compound_int(compound_str):
+    return int(tyre_compounds_ints.get(compound_str.upper(), -1))
+```
+`.get(key, default)` returns `-1` if the compound isn't found. `.upper()` normalises the string so `"soft"` and `"SOFT"` both work.
+
+```python
+def get_tyre_compound_str(compound_int):
+    for k, v in tyre_compounds_ints.items():
+        if v == compound_int:
+            return k
+    return "UNKNOWN"
+```
+This loops through the dictionary to do a **reverse lookup** — given `1`, return `"MEDIUM"`.
+
+---
+
+## File 3 — `src/lib/season.py`
+
+```python
+from datetime import datetime as date
+
+def get_season():
+    current_year_date = date.now()
+    return current_year_date.year if (current_year_date.month >= 2) else (current_year_date.year - 1)
+```
+F1 season starts in March. If the current month is January (month 1), the current season hasn't started yet so it returns last year. This is a simple **conditional expression** — Python's one-line if/else.
+
+---
+
+## File 4 — `src/lib/settings.py`
+
+This introduces two important Python patterns: **Singleton** and **Properties**.
+
+```python
+class SettingsManager:
+    DEFAULTS = {
+        "cache_location": ".fastf1-cache",
+        "computed_data_location": "computed_data",
+    }
+    _instance: Optional["SettingsManager"] = None
+```
+`DEFAULTS` is a **class variable** — shared across all instances. `_instance` stores the single shared instance. The underscore prefix `_` is a Python convention meaning "private — don't touch this from outside".
+
+```python
+def __new__(cls) -> "SettingsManager":
+    if cls._instance is None:
+        cls._instance = super().__new__(cls)
+        cls._instance._initialized = False
+    return cls._instance
+```
+`__new__` is called **before** `__init__`. This is the **Singleton pattern** — it ensures only one `SettingsManager` ever exists in memory. If you call `SettingsManager()` ten times, you get the same object back every time.
+
+```python
+@property
+def cache_location(self) -> str:
+    return self.get("cache_location")
+
+@cache_location.setter
+def cache_location(self, value: str) -> None:
+    self.set("cache_location", value)
+```
+`@property` turns a method into an attribute. So you can write `settings.cache_location` instead of `settings.get_cache_location()`. The `@setter` lets you write `settings.cache_location = "/new/path"` and it automatically calls the setter method.
+
+```python
+def load(self) -> None:
+    self._settings = dict(self.DEFAULTS)
+    if self._settings_file.exists():
+        with open(self._settings_file, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+```
+`dict(self.DEFAULTS)` creates a **copy** of the defaults dict (not a reference). `json.load(f)` reads a JSON file and converts it to a Python dictionary automatically.
+
+---
+
+## File 5 — `config.py` (your personal file)
+
+```python
+DEFAULT_YEAR = 2024
+DEFAULT_ROUND = 1
+DEFAULT_SPEED = 1.0
+SHOW_HUD = True
+```
+This is the simplest Python file possible — just **module-level constants**. Any file can import these with `import config` then use `config.DEFAULT_YEAR`. This is your personal customisation layer sitting on top of the project.
+
+---
+
+## File 6 — `src/lib/f1_data.py` — The Data Engine
+
+This is the most complex file. It fetches and processes all the real F1 data.
+
+```python
+import fastf1
+import numpy as np
+import pandas as pd
+from multiprocessing import Pool, cpu_count
+```
+**FastF1** is the library that connects to F1's official data API. **numpy** handles fast number arrays. **pandas** handles tabular data (like spreadsheets). **multiprocessing** lets the code run multiple tasks in parallel across CPU cores.
+
+```python
+FPS = 25
+DT = 1 / FPS
+```
+The replay runs at 25 frames per second. `DT` (delta time) is the time between frames — 0.04 seconds.
+
+```python
+def enable_cache():
+    settings = get_settings()
+    cache_path = settings.cache_location
+    if not os.path.exists(cache_path):
+        os.makedirs(cache_path)
+    fastf1.Cache.enable_cache(cache_path)
+```
+FastF1 downloads large amounts of data. Caching saves it locally so it doesn't re-download every time. `os.makedirs` creates the folder if it doesn't exist.
+
+```python
+def _process_single_driver(args):
+    driver_no, session, driver_code = args
+```
+The leading underscore means this is a **private/internal** function. It takes `args` as a tuple because Python's multiprocessing `Pool.map` can only pass one argument — so multiple values get packed into a tuple and **unpacked** on the first line.
+
+```python
+    for _, lap in laps_driver.iterlaps():
+        lap_tel = lap.get_telemetry()
+        t_lap = lap_tel["SessionTime"].dt.total_seconds().to_numpy()
+        x_lap = lap_tel["X"].to_numpy()
+```
+`iterlaps()` is a FastF1 method that loops over each lap. `.dt.total_seconds()` converts a pandas **timedelta** column (like `0:01:26.423`) into plain seconds. `.to_numpy()` converts a pandas Series to a raw numpy array for faster processing.
+
+```python
+        race_d_lap = total_dist_so_far + d_lap
+        t_all.append(t_lap)
+        x_all.append(x_lap)
+```
+Each lap's data is collected as a **list of arrays**. `total_dist_so_far` accumulates the total distance driven across all previous laps.
+
+```python
+    t_all, x_all, y_all = [np.concatenate(arr) for arr in all_arrays]
+```
+**List comprehension** — applies `np.concatenate` to each array list to merge all laps into one continuous array. This is a very Pythonic pattern.
+
+```python
+    order = np.argsort(t_all)
+    t_all = t_all[order]
+```
+`np.argsort` returns the **indices that would sort the array**. Applying those indices to every array ensures all data is sorted by time — critical for interpolation later.
+
+---
+
+### The Core Frame-Building Loop
+
+```python
+def get_race_telemetry(session, session_type="R"):
+```
+This is the main function that turns raw FastF1 data into the frame-by-frame format the replay uses.
+
+```python
+    with Pool(processes=num_processes) as pool:
+        results = pool.map(_process_single_driver, driver_args)
+```
+**Multiprocessing** — runs `_process_single_driver` for all 20 drivers **simultaneously** across CPU cores. This is why data loading is fast. `pool.map` is like Python's built-in `map()` but runs in parallel.
+
+```python
+    timeline = np.arange(global_t_min, global_t_max, DT) - global_t_min
+```
+Creates a **timeline array** — evenly spaced timestamps at 25 FPS intervals, shifted to start at zero.
+
+```python
+    x_resampled = np.interp(timeline, t_sorted, x_sorted)
+```
+**Linear interpolation** — the raw telemetry isn't recorded at exactly 25 FPS, so this resamples every driver's position onto the common timeline. `np.interp` is very fast because it's implemented in C.
+
+```python
+    for i in range(num_frames):
+        t = timeline[i]
+        snapshot = []
+        for code in driver_codes:
+            snapshot.append({
+                "code": code,
+                "x": float(d["x"][i]),
+                "y": float(d["y"][i]),
+                ...
+            })
+        snapshot.sort(key=lambda r: (r.get("lap", 0), r["dist"]), reverse=True)
+        frames.append({"t": t, "drivers": frame_data})
+```
+The **frame-building loop** — for every point in time, takes a snapshot of all drivers' positions, sorts them by race progress (lap + distance), and packages it into a dictionary. This is the format the Arcade replay window reads frame by frame.
+
+```python
+    with open(f"computed_data/{event_name}_race_telemetry.pkl", "wb") as f:
+        pickle.dump({...}, f, protocol=pickle.HIGHEST_PROTOCOL)
+```
+**Pickle** is Python's built-in serialisation format. It's 10-100x faster than JSON for large arrays. `"wb"` means "write binary". `HIGHEST_PROTOCOL` uses the most efficient compression available.
+
+---
+
+## File 7 — `src/interfaces/race_replay.py` — The Arcade Window
+
+This is the visual heart of the project.
+
+```python
+class F1RaceReplayWindow(arcade.Window):
+    def __init__(self, frames, track_statuses, ...):
+        super().__init__(SCREEN_WIDTH, SCREEN_HEIGHT, title, resizable=True)
+        self.maximize()
+```
+**Inheritance** — `F1RaceReplayWindow` extends `arcade.Window`. `super().__init__()` calls the parent class constructor. `self.maximize()` makes it fullscreen.
+
+```python
+        self._rot_rad = float(np.deg2rad(self.circuit_rotation))
+        self._cos_rot = float(np.cos(self._rot_rad))
+        self._sin_rot = float(np.sin(self._rot_rad))
+```
+Pre-computing cos and sin of the rotation angle **once** at startup rather than every frame is a performance optimisation. Trigonometric functions are expensive to call 25 times a second for every point.
+
+```python
+    def world_to_screen(self, x, y):
+        if self._rot_rad:
+            tx = x - world_cx
+            ty = y - world_cy
+            rx = tx * self._cos_rot - ty * self._sin_rot
+            ry = tx * self._sin_rot + ty * self._cos_rot
+            x, y = rx + world_cx, ry + world_cy
+        sx = self.world_scale * x + self.tx
+        sy = self.world_scale * y + self.ty
+        return sx, sy
+```
+**2D transformation matrix** — translates F1 GPS coordinates (world space, in metres) to screen pixel coordinates. First rotates around the track centre, then scales and translates to fit the screen. This is fundamental computer graphics maths.
+
+```python
+    def on_draw(self):
+        self.clear()
+        if self.bg_texture:
+            arcade.draw_lrbt_rectangle_textured(...)
+        arcade.draw_line_strip(self.screen_inner_points, track_color, 4)
+```
+`on_draw` is called **every frame** by the Arcade game loop. It draws everything from scratch each frame — background, track lines, cars, HUD. `draw_line_strip` connects a list of points with lines to draw the track.
+
+```python
+    def on_update(self, delta_time: float):
+        self.frame_index += delta_time * FPS * self.playback_speed
+```
+`on_update` is also called every frame, just before `on_draw`. `delta_time` is how many seconds since the last frame. Multiplying by `FPS` and `playback_speed` advances the replay at the correct speed. This is the standard **game loop** pattern.
+
+```python
+    def on_key_press(self, symbol: int, modifiers: int):
+        if symbol == arcade.key.SPACE:
+            self.paused = not self.paused
+        elif symbol == arcade.key.RIGHT:
+            self.is_forwarding = True
+            self.paused = True
+```
+Arcade calls `on_key_press` automatically when a key is pressed. `arcade.key.SPACE` is a constant integer. The `not` operator **toggles** a boolean. Setting `is_forwarding = True` then checking it in `on_update` implements **hold-to-seek**.
+
+```python
+    def _project_to_reference(self, x, y):
+        _, idx = self.track_tree.query([x, y])
+        return float(self._ref_cumdist[idx])
+```
+**KD-Tree** (from scipy) — a spatial data structure that finds the nearest point on the track to any given (x, y) car position in O(log N) time. This is used to calculate along-track distance for the leaderboard — you can't just use raw distance because it resets each lap.
+
+---
+
+## File 8 — `src/ui_components.py` — All the UI
+
+```python
+class BaseComponent:
+    def on_resize(self, window): pass
+    def draw(self, window): pass
+    def on_mouse_press(self, window, x, y, button, modifiers) -> bool: return False
+```
+A **base class** defining the interface all UI components must follow. The `pass` keyword means "do nothing" — subclasses **override** these methods. This is the **Template Method** pattern.
+
+```python
+class LeaderboardComponent(BaseComponent):
+    def __init__(self, x, width=240, visible=True):
+        self._tyre_textures = {}
+        tyres_folder = os.path.join("images", "tyres")
+        for filename in os.listdir(tyres_folder):
+            texture_name = os.path.splitext(filename)[0]
+            self._tyre_textures[texture_name] = arcade.load_texture(texture_path)
+```
+The leaderboard loads tyre images at startup and stores them in a dictionary keyed by filename. `os.path.splitext` splits `"SOFT.png"` into `("SOFT", ".png")` — `[0]` takes just the name.
+
+```python
+    @property
+    def visible(self) -> bool:
+        return self._visible
+
+    @visible.setter
+    def visible(self, value: bool):
+        self._visible = value
+```
+Same **property pattern** as `SettingsManager` — controls visibility cleanly.
+
+```python
+    def draw(self, window):
+        for i, (code, color, pos, progress_m) in enumerate(new_entries):
+            arcade.Text(f"{i+1}. {code}", left_x, top_y, text_color, 16).draw()
+```
+`enumerate` gives both the **index** `i` and the **value** simultaneously. Tuple **unpacking** `(code, color, pos, progress_m)` pulls apart the 4-element tuple in one line.
+
+```python
+def build_track_from_example_lap(example_lap, track_width=200):
+    dx = np.gradient(plot_x_ref)
+    dy = np.gradient(plot_y_ref)
+    norm = np.sqrt(dx**2 + dy**2)
+    nx = -dy
+    ny = dx
+    x_outer = plot_x_ref + nx * (track_width / 2)
+    x_inner = plot_x_ref - nx * (track_width / 2)
+```
+**Vector maths** — the track centre line is just a series of (x, y) points. To get inner and outer edges, the code computes the **normal vector** (perpendicular direction) at each point using `np.gradient`. Normalising by `norm` gives a unit vector, then offsetting by half the track width in each direction gives the two edges.
+
+---
+
+## File 9 — `src/bayesian_tyre_model.py` — The AI Model
+
+This is the most mathematically advanced file.
+
+```python
+from enum import Enum
+
+class TyreCategory(Enum):
+    SLICK = "SLICK"
+    INTER = "INTER"
+    WET = "WET"
+```
+**Enums** are named constants — safer than plain strings because if you typo `"SLCIK"` Python won't catch it, but `TyreCategory.SLCIK` raises an `AttributeError` immediately.
+
+```python
+@dataclass
+class TyreProfile:
+    name: str
+    degradation_rate: float
+    warmup_laps: int
+
+    def __post_init__(self):
+        if self.degradation_rate < 0:
+            raise ValueError(...)
+```
+`@dataclass` automatically generates `__init__`, `__repr__` etc. from the field declarations — saves writing boilerplate. `__post_init__` runs after `__init__` for validation.
+
+```python
+class BayesianTyreDegradationModel:
+    """
+    State equation:
+        α_{t+1} = (1 - I_pit) * (α_t + ν * A_track) + I_pit * α_reset + η_t
+    """
+```
+This implements a **Kalman Filter** — a mathematical algorithm that estimates hidden state (true tyre pace) from noisy observations (measured lap times). It's used in everything from GPS to rocket guidance. The core idea: maintain a best estimate of the tyre's true pace and update it each lap using the difference between predicted and actual lap time.
+
+```python
+    kalman_gain = var_pred / innovation_var
+    mu_alpha = mu_pred + kalman_gain * innovation
+    var_alpha = (1.0 - kalman_gain) * var_pred
+```
+The **Kalman update equations**. `kalman_gain` weights how much to trust the new measurement vs the prediction. High uncertainty in prediction → trust the measurement more. This is the mathematical core of the entire tyre model.
+
+---
+
+## File 10 — `src/gui/insights_menu.py` — The Side Panel
+
+```python
+from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout
+```
+**PySide6** is Python's binding to Qt — a cross-platform GUI framework. `QMainWindow` is a window. `QVBoxLayout` stacks widgets vertically.
+
+```python
+class InsightsMenu(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.opened_windows = []
+        self.setup_ui()
+```
+`self.opened_windows = []` is critical — it keeps **references** to opened windows. Without this, Python's garbage collector would destroy the windows immediately after creating them.
+
+```python
+    def launch_driver_telemetry(self):
+        from src.insights.driver_telemetry_window import DriverTelemetryWindow
+        window = DriverTelemetryWindow()
+        window.show()
+        self.opened_windows.append(window)
+```
+**Lazy import** — the `from ... import` is inside the function rather than at the top of the file. This means the module only loads when actually needed, speeding up startup.
+
+---
+
+## File 11 — `src/gui/pit_wall_window.py` — The Base Window
+
+```python
+class PitWallWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.client = TelemetryStreamClient()
+        self.client.data_received.connect(self._handle_data_received)
+```
+**Qt Signals and Slots** — `.connect()` wires up events. When `data_received` fires (a signal), `_handle_data_received` is called automatically (a slot). This is Qt's version of the **Observer pattern** — no polling, purely event-driven.
+
+```python
+    def _handle_data_received(self, data):
+        self.message_count += 1
+        self.on_telemetry_data(data)  # calls subclass
+
+    def on_telemetry_data(self, data):
+        pass  # subclasses override this
+```
+**Template Method pattern** — `_handle_data_received` does shared work (counting messages), then calls `on_telemetry_data` which subclasses override. The base class `pass` means "do nothing unless overridden".
+
+---
+
+## File 12 — `main.py` — The Entry Point
+
+```python
+if __name__ == "__main__":
+    if "--verbose" not in sys.argv:
+        logging.getLogger("fastf1").setLevel(logging.CRITICAL)
+```
+`if __name__ == "__main__"` only runs when the file is executed directly, not when imported. `sys.argv` is the list of command-line arguments. `logging.CRITICAL` silences FastF1's noisy output unless `--verbose` is passed.
+
+```python
+    session_type = 'SQ' if "--sprint-qualifying" in sys.argv else (
+                   'S'  if "--sprint"            in sys.argv else (
+                   'Q'  if "--qualifying"        in sys.argv else 'R'))
+```
+**Nested ternary expressions** — Python's chained if/else in one line. Reads: "SQ if sprint-qualifying flag exists, otherwise S if sprint exists, otherwise Q if qualifying exists, otherwise R (Race)."
+
+```python
+    app = QApplication(sys.argv)
+    win = RaceSelectionWindow()
+    win.show()
+    sys.exit(app.exec())
+```
+The Qt **event loop** — `app.exec()` starts it and blocks until the window closes. `sys.exit()` passes the exit code back to the operating system. This is the standard Qt application startup pattern.
+
+---
+
+## Summary — Python Concepts Used in This Project
+
+| Concept | Where Used |
+|---|---|
+| Classes & inheritance | All UI components, Window classes |
+| `@property` / `@setter` | SettingsManager, all components |
+| `@dataclass` | TyreProfile, StateSpaceConfig |
+| Enums | TyreCategory, TrackCondition |
+| List comprehensions | Frame building, resampling |
+| Multiprocessing | Driver telemetry loading |
+| numpy arrays | All telemetry data |
+| pandas DataFrames | FastF1 lap data |
+| KD-Tree | Nearest-point on track lookup |
+| Kalman Filter | Tyre degradation model |
+| Qt Signals/Slots | Telemetry streaming |
+| Pickle serialisation | Caching computed data |
+| Arcade game loop | `on_draw` / `on_update` / `on_key_press` |
+| Singleton pattern | SettingsManager |
+| Template Method pattern | PitWallWindow / BaseComponent |
+
